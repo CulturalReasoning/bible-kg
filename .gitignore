@@ -1,0 +1,23 @@
+# NOTE: a "#" only starts a comment at the START of a line. A trailing comment on
+# a pattern line becomes part of the pattern and silently disables it.
+
+__pycache__/
+*.pyc
+
+# Cached corpus embedding matrices: large (up to ~128 MB, over GitHub's limit)
+# and fully regenerable from the corpus.
+embeddings/
+
+# Script outputs: checkpoints, results.json, the BWS study CSVs. The BWS CSVs
+# quote the copyrighted work, so these must never be committed.
+artifacts/
+
+# Restricted gold-set data lives OUTSIDE this repository, in ../data-annotations,
+# so it cannot be committed by accident. These entries are a second line of
+# defence in case a copy is ever dropped in here.
+data/split-annotations.json
+data/relation_labeling_jaccard.json
+data/retrieval_tokens_dacy_small.json
+data/retrieval-ranks_annotated.csv
+data/per_query_oof.json
+data/bws_*.csv

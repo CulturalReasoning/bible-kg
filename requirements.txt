@@ -1,0 +1,19 @@
+numpy>=1.24
+pandas>=2.0
+scikit-learn>=1.3
+rank-bm25>=0.2.2
+
+# Pinned below 3.0: the training loop uses the `model.fit(train_objectives=...)`
+# API, which v3 replaced with a Trainer. Install a CUDA build of torch to match
+# your driver — see https://pytorch.org/get-started/locally/
+torch>=2.0
+sentence-transformers>=2.6,<3.0
+
+
+matplotlib>=3.7       
+scipy>=1.10           
+snowballstemmer>=2.2   # better Danish stemming than the built-in fallback
+nltk>=3.8              # only for TSDAE domain pretraining (--pretrain tsdae)
+
+dacy>=2.7
+spacy>=3.7
