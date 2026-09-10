@@ -4,7 +4,7 @@
     python scripts/build_bws.py
     python scripts/build_bws.py --out-dir artifacts/bws --seed 20260906
 
-See `cure/bws.py` for details
+See `tools/bws.py` for details
 """
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cure import Corpus, GoldSet
-from cure.bws import DEFAULT_SEED, REPS, build_pool, build_tuples, write_pool, write_study
-from cure.paths import ARTIFACTS
+from tools import Corpus, GoldSet
+from tools.bws import DEFAULT_SEED, REPS, build_pool, build_tuples, write_pool, write_study
+from tools.paths import ARTIFACTS
 
 
 def main() -> None:

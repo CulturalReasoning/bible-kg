@@ -11,10 +11,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cure import Corpus, GoldSet
-from cure.finetune import FinetuneConfig, cross_validate
-from cure.metrics import METRICS
-from cure.paths import ARTIFACTS, ensure_dir
+from tools import Corpus, GoldSet
+from tools.finetune import FinetuneConfig, cross_validate
+from tools.metrics import METRICS
+from tools.paths import ARTIFACTS, ensure_dir
 
 
 def main() -> None:
@@ -60,7 +60,7 @@ def main() -> None:
               f"± {row['finetuned_std']:.3f}  (Δ {row['finetuned'] - row['zero_shot']:+.3f})")
 
     print("\n=== fine-tuned (mean over folds) ===")
-    from cure.gold import BANDS
+    from tools.gold import BANDS
     header = "  {:12s}".format("band") + "".join(f"{m:>10s}" for m in METRICS)
     print(header)
     for band in BANDS:

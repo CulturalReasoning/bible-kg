@@ -10,9 +10,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cure import Corpus, GoldSet
-from cure.dense import DenseRetriever
-from cure.metrics import by_band, comparison_table
+from tools import Corpus, GoldSet
+from tools.dense import DenseRetriever
+from tools.metrics import by_band, comparison_table
 
 DEFAULT_MODELS = [
     "intfloat/multilingual-e5-large",

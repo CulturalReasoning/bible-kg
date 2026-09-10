@@ -7,12 +7,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 # DATA is for the Bible verses
 # ANNOTATIONS is for Blixen's work
-DATA = Path(os.environ.get("CURE_DATA", ROOT / "data")).resolve()
+DATA = Path(os.environ.get("tools_DATA", ROOT / "data")).resolve()
 ANNOTATIONS = Path(os.environ.get(
-    "CURE_ANNOTATIONS", ROOT.parent / "data-annotations")).resolve()
+    "tools_ANNOTATIONS", ROOT.parent / "data-annotations")).resolve()
 
-EMBEDDINGS = Path(os.environ.get("CURE_EMBEDDINGS", ROOT / "embeddings")).resolve()
-ARTIFACTS = Path(os.environ.get("CURE_ARTIFACTS", ROOT / "artifacts")).resolve()
+EMBEDDINGS = Path(os.environ.get("tools_EMBEDDINGS", ROOT / "embeddings")).resolve()
+ARTIFACTS = Path(os.environ.get("tools_ARTIFACTS", ROOT / "artifacts")).resolve()
 
 VERSES = "all_verses_ot_nt.json"              # 31,170 Bible verses (GT1871 + NT1907)
 

@@ -16,10 +16,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from cure import Corpus, GoldSet
-from cure.metrics import by_band, comparison_table
-from cure.sparse import BM25Retriever, TfidfRetriever, rank_all
-from cure.text import load_dacy_tokens
+from tools import Corpus, GoldSet
+from tools.metrics import by_band, comparison_table
+from tools.sparse import BM25Retriever, TfidfRetriever, rank_all
+from tools.text import load_dacy_tokens
 
 WORD = re.compile(r"\b\w\w+\b", re.UNICODE)
 

@@ -6,10 +6,10 @@ references from the scholarly commentary.
 
 example use:
 
-    from cure import Corpus, GoldSet
-    from cure.sparse import BM25Retriever, rank_all
-    from cure.text import load_dacy_tokens
-    from cure.metrics import by_band
+    from tools import Corpus, GoldSet
+    from tools.sparse import BM25Retriever, rank_all
+    from tools.text import load_dacy_tokens
+    from tools.metrics import by_band
 
     corpus = Corpus.load()
     gold = GoldSet.load(corpus)
