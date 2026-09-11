@@ -21,3 +21,6 @@ data/retrieval_tokens_dacy_small.json
 data/retrieval-ranks_annotated.csv
 data/per_query_oof.json
 data/bws_*.csv
+/data/LLM_annotations/prompts/
+/data/LLM_annotations/raw/
+/data/LLM_annotations/
