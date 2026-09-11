@@ -17,3 +17,5 @@ nltk>=3.8              # only for TSDAE domain pretraining (--pretrain tsdae)
 
 dacy>=2.7
 spacy>=3.7
+
+requests>=2.28        # LLM BWS annotation via OpenRouter (scripts/run_llm_bws.py)
