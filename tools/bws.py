@@ -2,21 +2,26 @@
 
 """
 from __future__ import annotations
+from datetime import datetime, timezone
 
+import os
+import sys
+
+import requests
 import collections
 import csv
 import json
 import random
 from pathlib import Path
-
+import time
 import numpy as np
 
 from .corpus import Corpus
 from .gold import GoldSet
-from .paths import PER_QUERY_OOF, annotation_file
+from .paths import DATA, PER_QUERY_OOF, ROOT, annotation_file
 from .sparse import BM25Retriever
 from .text import jaccard, load_dacy_tokens
-
+import re
 TOP_K = 3            #: candidates taken from each retriever
 REPS = 4             #: tuples each pair appears in
 TUPLE_SIZE = 4
@@ -26,6 +31,25 @@ DEFAULT_SEED = 20260906
 
 BINS = ("1_both", "2_bm25_only", "3_dfmft_only_jac", "4_dfmft_only_zero")
 
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_MODEL = "google/gemini-3-flash-preview"
+RETRIES = 3
+_LABEL_PAIR = re.compile(r"\b(best|worst)\b\s*[:=]?\s*(?:\w+\s+){0,2}[\"']?([1-4])\b",
+                          re.IGNORECASE)
+LABELS = "1234"
+CHOICES = set(LABELS)
+
+SYSTEM_PROMPT = (
+    "You are an expert on intertextuality between Danish literature and the "
+    "Danish Bible. You judge how convincing a proposed "
+    "intertextual reference is: a passage from Karen Blixen's short stories "
+    "paired with a candidate Bible verse. An intertextual reference "
+    "can be a quotation that reproduces distinctive wording from a biblical "
+    "source passage, allowing for minor linguistic variation, a paraphrase "
+    "that reformulates the content of a localized source passage without preserving "
+    "its wording, or an allusion evokes a particular biblical passage, event, figure, "
+    "or motif more indirectly."
+)
 
 def load_finetuned_rankings() -> dict[str, list[int]]:
     rows = json.loads(annotation_file(PER_QUERY_OOF).read_text(encoding="utf-8"))
@@ -184,3 +208,263 @@ def write_pool(pool: list[dict], out_dir: Path) -> Path:
         writer.writeheader()
         writer.writerows(pool)
     return path
+
+
+def load_pool(input_path: Path) -> list[dict]:
+    """load the quaples to be annotated. check sanity"""
+    with input_path.open(newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        grouped.setdefault(row["tuple_id"], []).append(row)
+    tuples: list[dict] = []
+    for tuple_id, members in grouped.items():
+        members.sort(key=lambda r: int(r["position"]))
+
+        if len(members) != 4:
+            raise ValueError(f"something wrong. {tuple_id} has {len(members)} rows ")
+        tuples.append({"tuple_id": tuple_id, "members": members})
+    return tuples
+
+def build_messages(tup: dict) -> list[dict]:
+    """The prompt for one tuple that contains four pairs of texts"""
+    candidates = "\n\n".join(
+        f"{label}. \nPassage: {member['blixen_text']}\n"
+        f"Verse {member['reference']}: {member['bible_text']}"
+        for label, member in zip(LABELS, tup["members"]))
+
+    user = (
+        "Below are four candidate (passage, verse) pairs. Decide which pair is "
+        "the most convincing intertextual reference (BEST) and which is the "
+        "least convincing (WORST).\n\n"
+        f"{candidates}\n\n"
+        'Answer with JSON only: {"best": "<1|2|3|4>", "worst": "<1|2|3|4>", '
+        '"best_reason": "one short sentence", "worst_reason": "one short sentence"}'
+    )
+    return [{"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user}]
+
+
+def query(messages: list[dict], model: str, api_key: str, timeout: int) -> dict:
+    """POST the chat request to OpenRouter; retries on network errors and 429s."""
+    headers = {"Authorization": f"Bearer {api_key}"}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    last_error: Exception | None = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            response = requests.post(API_URL, headers=headers, json=payload,
+                                     timeout=timeout)
+        except requests.RequestException as exc:
+            last_error = exc
+            time.sleep(2 ** attempt)
+            continue
+        if response.status_code in (400, 422) and "response_format" in payload:
+            payload.pop("response_format", None)   # retry without JSON mode
+            continue
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            time.sleep(float(retry_after) if retry_after else 2 ** attempt)
+            continue
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                f"OpenRouter authentication failed (HTTP {response.status_code}); "
+                "check OPENROUTER_API_KEY")
+        if response.status_code != 200:
+            last_error = RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+            time.sleep(2 ** attempt)
+            continue
+        return response.json()
+    raise RuntimeError(f"OpenRouter request failed after {RETRIES} attempts: {last_error}")
+
+def parse_answer(content: str) -> dict:
+    """Extract BEST/WORST from the model's answer, robust to prose and fences."""
+    text = content.strip()
+    cleaned = re.sub(r"```(?:json)?\s*\n?(.*?)\n?\s*```", r"\1", text,
+                     flags=re.DOTALL)
+    data: dict = {}
+    try:
+        candidate = json.loads(cleaned)
+        if isinstance(candidate, dict):
+            data = candidate
+    except json.JSONDecodeError:
+        pass
+
+    picks = {key.lower(): str(value).strip().upper()
+             for key, value in data.items()
+             if key.lower() in ("best", "worst") and str(value).strip().upper() in CHOICES}
+    for match in _LABEL_PAIR.finditer(text):
+        picks.setdefault(match.group(1).lower(), match.group(2).upper())
+
+    best, worst = picks.get("best", ""), picks.get("worst", "")
+    status = "ok" if best in CHOICES and worst in CHOICES and best != worst else "unparseable"
+    reasons = {key.lower(): value for key, value in data.items()
+               if isinstance(value, str) and key.lower().endswith("_reason")}
+    return {"status": status, "best": best, "worst": worst,
+            "best_reason": reasons.get("best_reason", ""),
+            "worst_reason": reasons.get("worst_reason", "")}
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def write_raw_answer(raw_dir: Path, tuple_id: str, model: str,
+                     messages: list[dict], response: dict) -> Path:
+    """Save the prompt sent and the complete API response for one tuple."""
+    path = raw_dir / f"{tuple_id}.json"
+    path.write_text(json.dumps({
+        "tuple_id": tuple_id,
+        "model": model,
+        "timestamp": _utc_now(),
+        "messages": messages,
+        "response": response,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def write_parsed_answer(parsed_dir: Path, tup: dict, model: str,
+                        response: dict) -> tuple[Path, dict]:
+    """Extract the annotation from the API response and save it.
+
+    Returns the written path and the parsed answer, so callers can report
+    the BEST/WORST picks without parsing twice.
+    """
+    message = response["choices"][0].get("message", {})
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        content = " ".join(str(part) for part in content)
+    answer = parse_answer(content)
+
+    labels = {label: member for label, member in zip(LABELS, tup["members"])}
+    parsed = {
+        "tuple_id": tup["tuple_id"],
+        "model": model,
+        "timestamp": _utc_now(),
+        "status": answer["status"],
+        "best": answer["best"],
+        "worst": answer["worst"],
+        "best_pair_id": labels.get(answer["best"], {}).get("pair_id", ""),
+        "worst_pair_id": labels.get(answer["worst"], {}).get("pair_id", ""),
+        "best_reference": labels.get(answer["best"], {}).get("reference", ""),
+        "worst_reference": labels.get(answer["worst"], {}).get("reference", ""),
+        "best_reason": answer["best_reason"],
+        "worst_reason": answer["worst_reason"],
+        "candidates": {
+            label: {"pair_id": member["pair_id"],
+                    "reference": member["reference"],
+                    "blixen_text": member["blixen_text"],
+                    "bible_text": member["bible_text"]}
+            for label, member in labels.items()},
+        "usage": response.get("usage", {}),
+    }
+    path = parsed_dir / f"{tup['tuple_id']}.json"
+    path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path, answer
+
+
+def write_aggregate(parsed_dir: Path, out_dir: Path) -> Path:
+    """Rebuild the combined CSV from every parsed file."""
+    rows = [json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(parsed_dir.glob("*.json"))]
+    fieldnames = ["tuple_id", "status", "best", "worst", "best_pair_id",
+                  "worst_pair_id", "best_reference", "worst_reference",
+                  "best_reason", "worst_reason", "model", "timestamp"]
+    path = out_dir / "bws_tuples_annotator.csv"
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def run_toy(tuples: list[dict], out_dir: Path, model: str, count: int) -> None:
+    """Save and print the first `count` prompts without querying the API."""
+    prompt_dir = out_dir / "prompts"
+    prompt_dir.mkdir(parents=True, exist_ok=True)
+    for tup in tuples[:count]:
+        messages = build_messages(tup)
+        path = prompt_dir / f"{tup['tuple_id']}.json"
+        path.write_text(json.dumps({
+            "tuple_id": tup["tuple_id"],
+            "model": model,
+            "messages": messages,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\n{'-' * 78}\n{tup['tuple_id']} -> {path}\n{'-' * 78}")
+        for message in messages:
+            print(f"[{message['role']}]\n{message['content']}\n")
+    print(f"saved {len(tuples[:count])} prompts to {prompt_dir} - no API calls were made")
+
+
+def run_llm_bws(input_path: Path = ROOT / "data" / "bws_tuples_annotator.csv",
+                out_dir: Path = DATA / "LLM_annotations",
+                model: str = DEFAULT_MODEL,
+                limit: int = 0, toy: int | None = None,
+                overwrite: bool = False, timeout: int = 120) -> None:
+    """Annotate the BWS tuples with an LLM through the OpenRouter API.
+
+    Reads `input_path` (four rows per tuple, as written by build_bws.py) and
+    asks the LLM, once per tuple, which candidate pair is the BEST match for
+    its Blixen passage and which is the WORST. The API key is read from the
+    OPENROUTER_API_KEY environment variable.
+
+    Every answer is saved immediately under `out_dir/raw/` and
+    `out_dir/parsed/`; tuples that already have a saved response are skipped
+    on rerun unless `overwrite` is set, so a crashed run can simply be
+    restarted. A combined CSV is rebuilt from the parsed files at the end.
+    With `toy=N` the first N prompts are instead written to
+    `out_dir/prompts/` and printed, without any API call.
+    """
+    tuples = load_pool(input_path)
+
+    if toy:
+        run_toy(tuples, out_dir, model, toy)
+        return
+
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        sys.exit("OPENROUTER_API_KEY is not set - export it before running, "
+                 "e.g. $env:OPENROUTER_API_KEY = \"sk-or-v1-...\"")
+
+    raw_dir = out_dir / "raw"
+    parsed_dir = out_dir / "parsed"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    parsed_dir.mkdir(parents=True, exist_ok=True)
+    pending = [tup for tup in tuples
+               if overwrite or not (raw_dir / f"{tup['tuple_id']}.json").exists()]
+    if limit:
+        pending = pending[:limit]
+    print(f"{len(pending)} of {len(tuples)} tuples to annotate "
+          f"(model {model}, out {out_dir})")
+    if not pending:
+        aggregate = write_aggregate(parsed_dir, out_dir)
+        print(f"nothing to annotate; wrote {aggregate}")
+        return
+
+    done = failed = 0
+    for number, tup in enumerate(pending, start=1):
+        try:
+            messages = build_messages(tup)
+            response = query(messages, model, api_key, timeout)
+            # save both raw and parsed responses of the LLM
+            write_raw_answer(raw_dir, tup["tuple_id"], model, messages, response)
+            _, answer = write_parsed_answer(parsed_dir, tup, model, response)
+
+            done += 1
+            print(f"[{number}/{len(pending)}] {tup['tuple_id']}: "
+                  f"best={answer['best']} worst={answer['worst']} ({answer['status']})")
+        except (requests.RequestException, RuntimeError, KeyError, IndexError,
+                json.JSONDecodeError, OSError) as exc:
+            failed += 1
+            print(f"[{number}/{len(pending)}] {tup['tuple_id']}: ERROR {exc}",
+                  file=sys.stderr)
+
+    aggregate = write_aggregate(parsed_dir, out_dir)
+    print(f"\ndone: {done} annotated, {failed} failed, "
+          f"{len(tuples) - len(pending)} skipped (already saved)")
+    print(f"wrote {aggregate}")
+
