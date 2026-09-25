@@ -2,26 +2,28 @@
 
 """
 from __future__ import annotations
-from datetime import datetime, timezone
 
-import os
-import sys
-
-import requests
 import collections
 import csv
 import json
+import os
 import random
-from pathlib import Path
+import re
+import sys
 import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence
+
 import numpy as np
+import requests
 
 from .corpus import Corpus
 from .gold import GoldSet
-from .paths import DATA, PER_QUERY_OOF, ROOT, annotation_file
+from .paths import ANNOTATIONS, DATA, PER_QUERY_OOF, ROOT, annotation_file
 from .sparse import BM25Retriever
 from .text import jaccard, load_dacy_tokens
-import re
+
 TOP_K = 3            #: candidates taken from each retriever
 REPS = 4             #: tuples each pair appears in
 TUPLE_SIZE = 4
@@ -31,8 +33,13 @@ DEFAULT_SEED = 20260906
 
 BINS = ("1_both", "2_bm25_only", "3_dfmft_only_jac", "4_dfmft_only_zero")
 
-API_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_MODEL = "google/gemini-3-flash-preview"
+# ---- LLM best-worst annotation -----------------------------------------
+
+MUNIN_MODEL = "danish-foundation-models/munin-qwen3.5-9B"   #: local HF chat model (GPU)
+DEEPSEEK_MODEL = "deepseek-v4-pro"                           #: default DeepSeek API model
+DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
+BACKENDS = ("munin", "deepseek")
+MAX_NEW_TOKENS = 512
 RETRIES = 3
 _LABEL_PAIR = re.compile(r"\b(best|worst)\b\s*[:=]?\s*(?:\w+\s+){0,2}[\"']?([1-4])\b",
                           re.IGNORECASE)
@@ -41,15 +48,77 @@ CHOICES = set(LABELS)
 
 SYSTEM_PROMPT = (
     "You are an expert on intertextuality between Danish literature and the "
-    "Danish Bible. You judge how convincing a proposed "
-    "intertextual reference is: a passage from Karen Blixen's short stories "
-    "paired with a candidate Bible verse. An intertextual reference "
-    "can be a quotation that reproduces distinctive wording from a biblical "
-    "source passage, allowing for minor linguistic variation, a paraphrase "
-    "that reformulates the content of a localized source passage without preserving "
-    "its wording, or an allusion evokes a particular biblical passage, event, figure, "
-    "or motif more indirectly."
+    "Danish Bible. You judge how convincing a proposed intertextual reference "
+    "is: a passage from Karen Blixen's short stories paired with a candidate "
+    "Bible verse. A valid intertextual reference can be a quotation that "
+    "reproduces distinctive wording from a biblical source passage, allowing "
+    "for minor linguistic variation, a paraphrase that reformulates the "
+    "content of a localized source passage without preserving its wording, or "
+    "an allusion that evokes a particular biblical passage, event, figure, or "
+    "motif more indirectly. The Blixen passage is shown together with its "
+    "surrounding context, where the passage itself is marked with [[double "
+    "brackets]]. In a best-worst scaling task you must pick, among four "
+    "candidate pairs, the pair with the most convincing intertextual "
+    "relationship (BEST) and the pair with the least convincing one (WORST)."
 )
+
+# Few-shot example: tuple Q0001 from ANNOTATIONS/bws_tuples.csv, annotated by
+# an expert (BEST=3, WORST=1).
+FEW_SHOT = [
+    {
+        "blixen_text": ("som Samson, da han stod op om Midnat og tog fat paa "
+                        "Dørene af Stadens Port og paa begge Stolperne, og "
+                        "løftede dem op med Bommen og lagde dem paa sine "
+                        "Skuldre og bar dem op paa Bjergets Top, som er lige "
+                        "for Hebron"),
+        "blixen_context": ("… denne Pige parat til at ride bort fra "
+                           "Seven-Klostret ligervis [[som Samson, da han stod "
+                           "op om Midnat og tog fat paa Dørene af Stadens Port "
+                           "og paa begge Stolperne, og løftede dem op med "
+                           "Bommen og lagde dem paa sine Skuldre og bar dem op "
+                           "paa Bjergets Top, som er lige for Hebron]]. Men "
+                           "hvis hun nu virkelig skulde faa Øje paa …"),
+        "reference": "Esajas' Bog 46:7",
+        "bible_text": ("De løfte den op, de bære den paa Skuldrene og sætte "
+                       "den paa dens Sted; der staar den, den viger ikke fra "
+                       "sit Sted, vil nogen end raabe til den, skal den dog "
+                       "ikke svare, den kan ikke frelse nogen af hans Nød."),
+    },
+    {
+        "blixen_text": "prædikede for os om vor Forfængelighed, og alle Tings Forgængelighed",
+        "blixen_context": ("… straalende Øjne. »Hvor de gamle Tanter havde "
+                           "Ret, naar de [[prædikede for os om vor "
+                           "Forfængelighed, og alle Tings Forgængelighed]]: De "
+                           "Folk, der raader de Unge til, fremfor alt, …"),
+        "reference": "Prædikerens Bog 6:11",
+        "bible_text": ("Thi der er mange Ting, de foraarsage megen "
+                       "Forfængelighed; hvad Fordel har et Menneske deraf?"),
+    },
+    {
+        "blixen_text": "ren af Hjertet",
+        "blixen_context": ("… som var den vor egen. Hvis jeg havde været saa "
+                           "[[ren af Hjertet]] som hun var, kunde jeg vel have "
+                           "tænkt paa at …"),
+        "reference": "Ordsprogenes Bog 20:9",
+        "bible_text": "Hvo kan sige: Jeg har renset mit Hjerte; jeg er ren for min Synd?",
+    },
+    {
+        "blixen_text": "i din egen hellige Bog, at alle Ting tjener den tilgode, der elsker Gud",
+        "blixen_context": ("… hvor som helst jeg færdes. Det staar jo ogsaa "
+                           "skrevet [[i din egen hellige Bog, at alle Ting "
+                           "tjener den tilgode, der elsker Gud]].« »Kom nu "
+                           "denne Kærlighedserklæring,« spurgte Lincoln, »fra "
+                           "Hjertet? Eller …"),
+        "reference": "Salmernes Bog 119:128",
+        "bible_text": ("Derfor holder jeg alle dine Befalinger om alle Ting "
+                       "for at være rette; jeg hader al Løgnens Vej. XVII."),
+    },
+]
+FEW_SHOT_ANSWER = {
+    "best": "3",
+    "worst": "1"
+}
+
 
 def load_finetuned_rankings() -> dict[str, list[int]]:
     rows = json.loads(annotation_file(PER_QUERY_OOF).read_text(encoding="utf-8"))
@@ -211,9 +280,17 @@ def write_pool(pool: list[dict], out_dir: Path) -> Path:
 
 
 def load_pool(input_path: Path) -> list[dict]:
-    """load the quaples to be annotated. check sanity"""
-    with input_path.open(newline="", encoding="utf-8") as fh:
+    """load the tuples to be annotated. check sanity"""
+    with input_path.open(newline="", encoding="utf-8-sig") as fh:
         rows = list(csv.DictReader(fh))
+    if not rows:
+        raise ValueError(f"no rows found in {input_path}")
+    expected = ("tuple_id", "position", "relation", "pair_id", "reference",
+                "bible_url", "blixen_text", "blixen_context", "bible_text",
+                "BEST", "WORST")
+    missing = [field for field in expected if field not in rows[0]]
+    if missing:
+        raise ValueError(f"missing columns {missing} in {input_path}")
     grouped: dict[str, list[dict]] = {}
     for row in rows:
         grouped.setdefault(row["tuple_id"], []).append(row)
@@ -226,18 +303,35 @@ def load_pool(input_path: Path) -> list[dict]:
         tuples.append({"tuple_id": tuple_id, "members": members})
     return tuples
 
+
+def _gold_picks(members: list[dict]) -> tuple[str, str]:
+    """gold BEST/WORST from the input rows, marked with an "x" in the columns"""
+    marked = lambda column: next(
+        (member["position"] for member in members
+         if member.get(column, "").strip().lower() == "x"), "")
+    return marked("BEST"), marked("WORST")
+
+
+def _format_candidates(candidates: list[dict]) -> str:
+    blocks = []
+    for label, member in zip(LABELS, candidates):
+        blocks.append(
+            f"{label}.\n"
+            f"Blixen passage: {member['blixen_text']}\n"
+            f"Context: {member['blixen_context']}\n"
+            f"Bible verse ({member['reference']}): {member['bible_text']}")
+    return "\n\n".join(blocks)
+
+
 def build_messages(tup: dict) -> list[dict]:
     """The prompt for one tuple that contains four pairs of texts"""
-    candidates = "\n\n".join(
-        f"{label}. \nPassage: {member['blixen_text']}\n"
-        f"Verse {member['reference']}: {member['bible_text']}"
-        for label, member in zip(LABELS, tup["members"]))
-
     user = (
-        "Below are four candidate (passage, verse) pairs. Decide which pair is "
-        "the most convincing intertextual reference (BEST) and which is the "
-        "least convincing (WORST).\n\n"
-        f"{candidates}\n\n"
+        "Here is an example of the task, annotated by an expert:\n\n"
+        f"{_format_candidates(FEW_SHOT)}\n\n"
+        "Expert answer: "
+        + json.dumps(FEW_SHOT_ANSWER, ensure_ascii=False) + "\n\n"
+        "Now judge the four candidate pairs below in the same way:\n\n"
+        f"{_format_candidates(tup['members'])}\n\n"
         'Answer with JSON only: {"best": "<1|2|3|4>", "worst": "<1|2|3|4>", '
         '"best_reason": "one short sentence", "worst_reason": "one short sentence"}'
     )
@@ -245,41 +339,92 @@ def build_messages(tup: dict) -> list[dict]:
             {"role": "user", "content": user}]
 
 
-def query(messages: list[dict], model: str, api_key: str, timeout: int) -> dict:
-    """POST the chat request to OpenRouter; retries on network errors and 429s."""
+class MuninBackend:
+    """The local munin model, loaded on the GPU through huggingface transformers.
+
+    Generations are returned in the same OpenAI-style shape as the API
+    backends, so the parsing and saving code below is shared.
+    """
+
+    def __init__(self, model_name: str = MUNIN_MODEL, max_new_tokens: int = MAX_NEW_TOKENS):
+        self.model_name = model_name
+        self.max_new_tokens = max_new_tokens
+        print(f"loading {model_name} on GPU ...", flush=True)
+        self.tokenizer, self.model = self._load(model_name)
+
+    @staticmethod
+    def _load(model_name: str):
+        import torch  # imported lazily: toy mode must not require torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        if not torch.cuda.is_available():
+            raise RuntimeError("no CUDA GPU available - run munin on a GPU node")
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, torch_dtype=torch.bfloat16, trust_remote_code=True)
+        except (ValueError, RuntimeError, torch.OutOfMemoryError):
+            print("bfloat16 failed, falling back to float16", flush=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name, torch_dtype=torch.float16, trust_remote_code=True)
+        model.to("cuda")
+        return tokenizer, model
+
+    def query(self, messages: list[dict]) -> dict:
+        import torch
+        torch.manual_seed(0)
+        prompt = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        output = self.model.generate(
+            **inputs, max_new_tokens=self.max_new_tokens, do_sample=False,
+            pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id)
+        content = self.tokenizer.decode(output[0][inputs["input_ids"].shape[1]:],
+                                        skip_special_tokens=True)
+        return {"choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": int(inputs["input_ids"].shape[1]),
+                          "completion_tokens": int(output.shape[1] - inputs["input_ids"].shape[1])}}
+
+
+def query_deepseek(messages: list[dict], model: str, api_key: str, timeout: int) -> dict:
+    """POST the chat request to the DeepSeek API; retries on network errors and 429s."""
     headers = {"Authorization": f"Bearer {api_key}"}
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0,
-        "response_format": {"type": "json_object"},
+        "stream": False,
     }
     last_error: Exception | None = None
     for attempt in range(1, RETRIES + 1):
         try:
-            response = requests.post(API_URL, headers=headers, json=payload,
+            response = requests.post(DEEPSEEK_URL, headers=headers, json=payload,
                                      timeout=timeout)
         except requests.RequestException as exc:
             last_error = exc
             time.sleep(2 ** attempt)
             continue
-        if response.status_code in (400, 422) and "response_format" in payload:
-            payload.pop("response_format", None)   # retry without JSON mode
-            continue
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
             time.sleep(float(retry_after) if retry_after else 2 ** attempt)
             continue
-        if response.status_code in (401, 403):
+        if response.status_code in (401, 402, 403):
             raise RuntimeError(
-                f"OpenRouter authentication failed (HTTP {response.status_code}); "
-                "check OPENROUTER_API_KEY")
+                f"DeepSeek authentication failed (HTTP {response.status_code}); "
+                "check DEEPSEEK_API_KEY")
         if response.status_code != 200:
             last_error = RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
             time.sleep(2 ** attempt)
             continue
         return response.json()
-    raise RuntimeError(f"OpenRouter request failed after {RETRIES} attempts: {last_error}")
+    raise RuntimeError(f"DeepSeek request failed after {RETRIES} attempts: {last_error}")
+
+
+def _json_span(text: str) -> str:
+    """The text between the first `{` and the last `}`, for answers with prose
+    around or after the JSON object."""
+    start, end = text.find("{"), text.rfind("}")
+    return text[start:end + 1] if 0 <= start < end else ""
+
 
 def parse_answer(content: str) -> dict:
     """Extract BEST/WORST from the model's answer, robust to prose and fences."""
@@ -287,12 +432,14 @@ def parse_answer(content: str) -> dict:
     cleaned = re.sub(r"```(?:json)?\s*\n?(.*?)\n?\s*```", r"\1", text,
                      flags=re.DOTALL)
     data: dict = {}
-    try:
-        candidate = json.loads(cleaned)
-        if isinstance(candidate, dict):
-            data = candidate
-    except json.JSONDecodeError:
-        pass
+    for candidate in (cleaned, _json_span(cleaned)):
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                data = parsed
+                break
+        except json.JSONDecodeError:
+            continue
 
     picks = {key.lower(): str(value).strip().upper()
              for key, value in data.items()
@@ -315,7 +462,7 @@ def _utc_now() -> str:
 
 def write_raw_answer(raw_dir: Path, tuple_id: str, model: str,
                      messages: list[dict], response: dict) -> Path:
-    """Save the prompt sent and the complete API response for one tuple."""
+    """Save the prompt sent and the complete response for one tuple."""
     path = raw_dir / f"{tuple_id}.json"
     path.write_text(json.dumps({
         "tuple_id": tuple_id,
@@ -329,7 +476,7 @@ def write_raw_answer(raw_dir: Path, tuple_id: str, model: str,
 
 def write_parsed_answer(parsed_dir: Path, tup: dict, model: str,
                         response: dict) -> tuple[Path, dict]:
-    """Extract the annotation from the API response and save it.
+    """Extract the annotation from the response and save it.
 
     Returns the written path and the parsed answer, so callers can report
     the BEST/WORST picks without parsing twice.
@@ -341,6 +488,7 @@ def write_parsed_answer(parsed_dir: Path, tup: dict, model: str,
     answer = parse_answer(content)
 
     labels = {label: member for label, member in zip(LABELS, tup["members"])}
+    gold_best, gold_worst = _gold_picks(tup["members"])
     parsed = {
         "tuple_id": tup["tuple_id"],
         "model": model,
@@ -354,10 +502,15 @@ def write_parsed_answer(parsed_dir: Path, tup: dict, model: str,
         "worst_reference": labels.get(answer["worst"], {}).get("reference", ""),
         "best_reason": answer["best_reason"],
         "worst_reason": answer["worst_reason"],
+        "gold_best": gold_best,
+        "gold_worst": gold_worst,
         "candidates": {
             label: {"pair_id": member["pair_id"],
+                    "relation": member.get("relation", ""),
                     "reference": member["reference"],
+                    "bible_url": member.get("bible_url", ""),
                     "blixen_text": member["blixen_text"],
+                    "blixen_context": member.get("blixen_context", ""),
                     "bible_text": member["bible_text"]}
             for label, member in labels.items()},
         "usage": response.get("usage", {}),
@@ -373,7 +526,8 @@ def write_aggregate(parsed_dir: Path, out_dir: Path) -> Path:
             for path in sorted(parsed_dir.glob("*.json"))]
     fieldnames = ["tuple_id", "status", "best", "worst", "best_pair_id",
                   "worst_pair_id", "best_reference", "worst_reference",
-                  "best_reason", "worst_reason", "model", "timestamp"]
+                  "best_reason", "worst_reason", "gold_best", "gold_worst",
+                  "model", "timestamp"]
     path = out_dir / "bws_tuples_annotator.csv"
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
@@ -382,8 +536,37 @@ def write_aggregate(parsed_dir: Path, out_dir: Path) -> Path:
     return path
 
 
-def run_toy(tuples: list[dict], out_dir: Path, model: str, count: int) -> None:
-    """Save and print the first `count` prompts without querying the API."""
+def write_annotated_csv(tuples: list[dict], parsed_dir: Path, out_path: Path) -> Path:
+    """Rewrite the input CSV with the LLM picks filled into the BEST/WORST columns."""
+    parsed = {}
+    for path in sorted(parsed_dir.glob("*.json")):
+        answer = json.loads(path.read_text(encoding="utf-8"))
+        parsed[answer["tuple_id"]] = answer
+
+    fieldnames = list(tuples[0]["members"][0].keys())
+    rows = []
+    for tup in tuples:
+        answer = parsed.get(tup["tuple_id"], {})
+        for member in tup["members"]:
+            row = dict(member)
+            if answer.get("status") == "ok":
+                row["BEST"] = "x" if member["position"] == answer["best"] else ""
+                row["WORST"] = "x" if member["position"] == answer["worst"] else ""
+            rows.append(row)
+
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return out_path
+
+
+def run_toy(tuples: list[dict], out_dir: Path, backends: Sequence[str], count: int) -> None:
+    """Save and print the first `count` prompts without loading any model."""
+    try:                       # Danish text on a cp1252/gbk console would crash
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
     prompt_dir = out_dir / "prompts"
     prompt_dir.mkdir(parents=True, exist_ok=True)
     for tup in tuples[:count]:
@@ -391,80 +574,118 @@ def run_toy(tuples: list[dict], out_dir: Path, model: str, count: int) -> None:
         path = prompt_dir / f"{tup['tuple_id']}.json"
         path.write_text(json.dumps({
             "tuple_id": tup["tuple_id"],
-            "model": model,
+            "backends": list(backends),
             "messages": messages,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"\n{'-' * 78}\n{tup['tuple_id']} -> {path}\n{'-' * 78}")
         for message in messages:
             print(f"[{message['role']}]\n{message['content']}\n")
-    print(f"saved {len(tuples[:count])} prompts to {prompt_dir} - no API calls were made")
+    print(f"saved {len(tuples[:count])} prompts to {prompt_dir} "
+          "- no models loaded, no API calls were made")
 
 
-def run_llm_bws(input_path: Path = ROOT / "data" / "bws_tuples_annotator.csv",
+def run_llm_bws(input_path: Path | None = None,
                 out_dir: Path = DATA / "LLM_annotations",
-                model: str = DEFAULT_MODEL,
+                backends: Sequence[str] = BACKENDS,
+                munin_model: str = MUNIN_MODEL,
+                deepseek_model: str = DEEPSEEK_MODEL,
                 limit: int = 0, toy: int | None = None,
-                overwrite: bool = False, timeout: int = 120) -> None:
-    """Annotate the BWS tuples with an LLM through the OpenRouter API.
+                overwrite: bool = False, timeout: int = 120,
+                max_new_tokens: int = MAX_NEW_TOKENS) -> None:
+    """Annotate the BWS tuples with an LLM.
 
-    Reads `input_path` (four rows per tuple, as written by build_bws.py) and
-    asks the LLM, once per tuple, which candidate pair is the BEST match for
-    its Blixen passage and which is the WORST. The API key is read from the
-    OPENROUTER_API_KEY environment variable.
+    Reads `input_path` (default ANNOTATIONS/bws_tuples.csv, four rows per
+    tuple) and asks each backend, once per tuple, which candidate pair has the
+    most convincing intertextual relationship (BEST) and which the least
+    convincing one (WORST). `backends` is a subset of {"munin", "deepseek"}:
+    munin is loaded locally on the GPU, deepseek goes through the DeepSeek API
+    (the key is read from the DEEPSEEK_API_KEY environment variable).
 
-    Every answer is saved immediately under `out_dir/raw/` and
-    `out_dir/parsed/`; tuples that already have a saved response are skipped
-    on rerun unless `overwrite` is set, so a crashed run can simply be
-    restarted. A combined CSV is rebuilt from the parsed files at the end.
+    Every answer is saved immediately under `out_dir/<model>/raw/` and
+    `out_dir/<model>/parsed/`; tuples that already have a saved response are
+    skipped on rerun unless `overwrite` is set, so a crashed run can simply be
+    restarted. A combined CSV plus the input CSV with the picks filled into
+    the BEST/WORST columns are rebuilt from the parsed files at the end.
     With `toy=N` the first N prompts are instead written to
-    `out_dir/prompts/` and printed, without any API call.
+    `out_dir/prompts/` and printed, without loading any model or calling any
+    API.
     """
+    if input_path is None:
+        input_path = ANNOTATIONS / "bws_tuples.csv"
     tuples = load_pool(input_path)
 
+    unknown = set(backends) - set(BACKENDS)
+    if unknown:
+        raise ValueError(f"unknown backends {unknown}; choose from {BACKENDS}")
+
     if toy:
-        run_toy(tuples, out_dir, model, toy)
+        run_toy(tuples, out_dir, backends, toy)
         return
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        sys.exit("OPENROUTER_API_KEY is not set - export it before running, "
-                 "e.g. $env:OPENROUTER_API_KEY = \"sk-or-v1-...\"")
+    print(f"{len(tuples)} tuples to annotate with {', '.join(backends)}")
+    for backend in backends:
+        model = munin_model if backend == "munin" else deepseek_model
+        if backend == "deepseek" and not os.environ.get("DEEPSEEK_API_KEY"):
+            sys.exit("DEEPSEEK_API_KEY is not set - export it before running, "
+                     "e.g. $env:DEEPSEEK_API_KEY = \"sk-...\"")
+        _run_backend(tuples, backend, model, out_dir, limit, overwrite,
+                     timeout, max_new_tokens)
 
-    raw_dir = out_dir / "raw"
-    parsed_dir = out_dir / "parsed"
+
+def _run_backend(tuples: list[dict], backend: str, model: str, out_dir: Path,
+                 limit: int, overwrite: bool, timeout: int,
+                 max_new_tokens: int) -> None:
+    work_dir = out_dir / model.rstrip("/").split("/")[-1]   # HF name or local path
+    raw_dir = work_dir / "raw"
+    parsed_dir = work_dir / "parsed"
     raw_dir.mkdir(parents=True, exist_ok=True)
     parsed_dir.mkdir(parents=True, exist_ok=True)
+
+    if backend == "deepseek":
+        api_key = os.environ["DEEPSEEK_API_KEY"]
+        def query(messages: list[dict]) -> dict:
+            return query_deepseek(messages, model, api_key, timeout)
+    else:
+        munin = MuninBackend(model, max_new_tokens)
+        def query(messages: list[dict]) -> dict:
+            return munin.query(messages)
+
     pending = [tup for tup in tuples
                if overwrite or not (raw_dir / f"{tup['tuple_id']}.json").exists()]
     if limit:
         pending = pending[:limit]
-    print(f"{len(pending)} of {len(tuples)} tuples to annotate "
-          f"(model {model}, out {out_dir})")
+    print(f"[{backend}] {len(pending)} of {len(tuples)} tuples to annotate "
+          f"(model {model}, out {work_dir})", flush=True)
     if not pending:
-        aggregate = write_aggregate(parsed_dir, out_dir)
-        print(f"nothing to annotate; wrote {aggregate}")
+        aggregate = write_aggregate(parsed_dir, work_dir)
+        annotated = write_annotated_csv(tuples, parsed_dir,
+                                        work_dir / "bws_tuples_annotated.csv")
+        print(f"[{backend}] nothing to annotate; wrote {aggregate}")
+        print(f"[{backend}] wrote {annotated}")
         return
 
     done = failed = 0
     for number, tup in enumerate(pending, start=1):
         try:
             messages = build_messages(tup)
-            response = query(messages, model, api_key, timeout)
+            response = query(messages)
             # save both raw and parsed responses of the LLM
             write_raw_answer(raw_dir, tup["tuple_id"], model, messages, response)
             _, answer = write_parsed_answer(parsed_dir, tup, model, response)
 
             done += 1
-            print(f"[{number}/{len(pending)}] {tup['tuple_id']}: "
-                  f"best={answer['best']} worst={answer['worst']} ({answer['status']})")
+            print(f"[{backend} {number}/{len(pending)}] {tup['tuple_id']}: "
+                  f"best={answer['best']} worst={answer['worst']} ({answer['status']})",
+                  flush=True)
         except (requests.RequestException, RuntimeError, KeyError, IndexError,
                 json.JSONDecodeError, OSError) as exc:
             failed += 1
-            print(f"[{number}/{len(pending)}] {tup['tuple_id']}: ERROR {exc}",
-                  file=sys.stderr)
+            print(f"[{backend} {number}/{len(pending)}] {tup['tuple_id']}: ERROR {exc}",
+                  file=sys.stderr, flush=True)
 
-    aggregate = write_aggregate(parsed_dir, out_dir)
-    print(f"\ndone: {done} annotated, {failed} failed, "
+    aggregate = write_aggregate(parsed_dir, work_dir)
+    annotated = write_annotated_csv(tuples, parsed_dir,
+                                    work_dir / "bws_tuples_annotated.csv")
+    print(f"\n[{backend}] done: {done} annotated, {failed} failed, "
           f"{len(tuples) - len(pending)} skipped (already saved)")
-    print(f"wrote {aggregate}")
-
+    print(f"[{backend}] wrote {aggregate}\n[{backend}] wrote {annotated}")
