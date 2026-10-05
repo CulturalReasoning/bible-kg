@@ -11,12 +11,14 @@ import random
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import requests
+from requests.adapters import HTTPAdapter
 
 from .corpus import Corpus
 from .gold import GoldSet
@@ -35,14 +37,21 @@ BINS = ("1_both", "2_bm25_only", "3_dfmft_only_jac", "4_dfmft_only_zero")
 
 # ---- LLM best-worst annotation -----------------------------------------
 
-MUNIN_MODEL = "danish-foundation-models/munin-qwen3.5-9B"   #: local HF chat model (GPU)
-DEEPSEEK_MODEL = "deepseek-v4-pro"                           #: default DeepSeek API model
+MUNIN_MODEL = "danish-foundation-models/munin-qwen3.5-9B"
+DEEPSEEK_MODEL = "deepseek-flash"
 DEEPSEEK_URL = "https://api.deepseek.com/chat/completions"
 BACKENDS = ("munin", "deepseek")
 MAX_NEW_TOKENS = 512
-RETRIES = 3
+RETRIES = 5
+DEFAULT_WORKERS = 30   #: concurrent DeepSeek requests; limit is 2500 for deepseek-flash
+
+# requests' default pool holds only 10 connections, which would throttle the threads
+_DEEPSEEK_SESSION = requests.Session()
+_DEEPSEEK_SESSION.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=512))
+
 _LABEL_PAIR = re.compile(r"\b(best|worst)\b\s*[:=]?\s*(?:\w+\s+){0,2}[\"']?([1-4])\b",
                           re.IGNORECASE)
+
 LABELS = "1234"
 CHOICES = set(LABELS)
 
@@ -386,7 +395,11 @@ class MuninBackend:
 
 
 def query_deepseek(messages: list[dict], model: str, api_key: str, timeout: int) -> dict:
-    """POST the chat request to the DeepSeek API; retries on network errors and 429s."""
+    """POST the chat request to the DeepSeek API; retries on network errors and 429s.
+
+    Thread-safe: called concurrently from worker threads (requests.Session
+    is safe for this simple usage, and no shared state is mutated here).
+    """
     headers = {"Authorization": f"Bearer {api_key}"}
     payload = {
         "model": model,
@@ -397,8 +410,8 @@ def query_deepseek(messages: list[dict], model: str, api_key: str, timeout: int)
     last_error: Exception | None = None
     for attempt in range(1, RETRIES + 1):
         try:
-            response = requests.post(DEEPSEEK_URL, headers=headers, json=payload,
-                                     timeout=timeout)
+            response = _DEEPSEEK_SESSION.post(DEEPSEEK_URL, headers=headers,
+                                             json=payload, timeout=timeout)
         except requests.RequestException as exc:
             last_error = exc
             time.sleep(2 ** attempt)
@@ -419,27 +432,67 @@ def query_deepseek(messages: list[dict], model: str, api_key: str, timeout: int)
     raise RuntimeError(f"DeepSeek request failed after {RETRIES} attempts: {last_error}")
 
 
-def _json_span(text: str) -> str:
-    """The text between the first `{` and the last `}`, for answers with prose
-    around or after the JSON object."""
-    start, end = text.find("{"), text.rfind("}")
-    return text[start:end + 1] if 0 <= start < end else ""
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_TAG = re.compile(r"</?think>", re.IGNORECASE)
+
+
+def _json_objects(text: str) -> list[str]:
+    """Each outermost balanced `{...}` object in `text`, in order. Handles
+    duplicated JSON objects and prose around or between them."""
+    objects, depth, start = [], 0, -1
+    in_string = escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                objects.append(text[start:index + 1])
+    return objects
 
 
 def parse_answer(content: str) -> dict:
-    """Extract BEST/WORST from the model's answer, robust to prose and fences."""
+    """Extract BEST/WORST from the model's answer, robust to prose and fences.
+
+    Munin is a reasoning model and can leak `<think>` traces (which may
+    contain braces), repeat the JSON object, or add prose around it. The
+    parser strips thinking traces, then tries the whole text, then each
+    balanced JSON object separately, then a regex scan of the raw text.
+    """
     text = content.strip()
-    cleaned = re.sub(r"```(?:json)?\s*\n?(.*?)\n?\s*```", r"\1", text,
-                     flags=re.DOTALL)
-    data: dict = {}
-    for candidate in (cleaned, _json_span(cleaned)):
+    text = _THINK_BLOCK.sub(" ", text)
+    text = _THINK_TAG.sub(" ", text)
+    text = re.sub(r"```(?:json)?\s*\n?(.*?)\n?\s*```", r"\1", text,
+                  flags=re.DOTALL)
+
+    parsed_objects: list[dict] = []
+    for candidate in (text, *_json_objects(text)):
         try:
             parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                data = parsed
-                break
+            if isinstance(parsed, dict) and parsed not in parsed_objects:
+                parsed_objects.append(parsed)
         except json.JSONDecodeError:
             continue
+
+    data: dict = {}
+    for parsed in parsed_objects:
+        if any(key.lower() in ("best", "worst") for key in parsed):
+            data = parsed
+            break
+    if not data and parsed_objects:
+        data = parsed_objects[0]
 
     picks = {key.lower(): str(value).strip().upper()
              for key, value in data.items()
@@ -584,6 +637,37 @@ def run_toy(tuples: list[dict], out_dir: Path, backends: Sequence[str], count: i
           "- no models loaded, no API calls were made")
 
 
+def reparse_raws(tuples: list[dict], model: str, out_dir: Path) -> None:
+    """Re-derive the parsed answers from the saved raw responses, without
+    querying any model. Useful after improving parse_answer: unparseable
+    answers that were saved can be recovered for free."""
+    work_dir = out_dir / model.rstrip("/").split("/")[-1]
+    raw_dir = work_dir / "raw"
+    parsed_dir = work_dir / "parsed"
+    if not raw_dir.exists():
+        print(f"[reparse] no raw answers for {model} under {work_dir}")
+        return
+    parsed_dir.mkdir(parents=True, exist_ok=True)
+
+    by_id = {tup["tuple_id"]: tup for tup in tuples}
+    rederived = skipped = 0
+    for path in sorted(raw_dir.glob("*.json")):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        tup = by_id.get(raw.get("tuple_id"))
+        if tup is None:
+            skipped += 1
+            continue
+        write_parsed_answer(parsed_dir, tup, model, raw["response"])
+        rederived += 1
+
+    n_ok = sum(json.loads(path.read_text(encoding="utf-8")).get("status") == "ok"
+               for path in parsed_dir.glob("*.json"))
+    print(f"[reparse] {model}: re-derived {rederived} parsed answers "
+          f"({skipped} raw files not in the input CSV); {n_ok} of them now ok")
+    write_aggregate(parsed_dir, work_dir)
+    write_annotated_csv(tuples, parsed_dir, work_dir / "bws_tuples_annotated.csv")
+
+
 def run_llm_bws(input_path: Path | None = None,
                 out_dir: Path = DATA / "LLM_annotations",
                 backends: Sequence[str] = BACKENDS,
@@ -591,7 +675,9 @@ def run_llm_bws(input_path: Path | None = None,
                 deepseek_model: str = DEEPSEEK_MODEL,
                 limit: int = 0, toy: int | None = None,
                 overwrite: bool = False, timeout: int = 120,
-                max_new_tokens: int = MAX_NEW_TOKENS) -> None:
+                max_new_tokens: int = MAX_NEW_TOKENS,
+                reparse: bool = False,
+                workers: int = DEFAULT_WORKERS) -> None:
     """Annotate the BWS tuples with an LLM.
 
     Reads `input_path` (default ANNOTATIONS/bws_tuples.csv, four rows per
@@ -601,6 +687,9 @@ def run_llm_bws(input_path: Path | None = None,
     munin is loaded locally on the GPU, deepseek goes through the DeepSeek API
     (the key is read from the DEEPSEEK_API_KEY environment variable).
 
+    The deepseek backend sends up to `workers` requests concurrently; the
+    local munin backend always runs sequentially.
+
     Every answer is saved immediately under `out_dir/<model>/raw/` and
     `out_dir/<model>/parsed/`; tuples that already have a saved response are
     skipped on rerun unless `overwrite` is set, so a crashed run can simply be
@@ -608,7 +697,8 @@ def run_llm_bws(input_path: Path | None = None,
     the BEST/WORST columns are rebuilt from the parsed files at the end.
     With `toy=N` the first N prompts are instead written to
     `out_dir/prompts/` and printed, without loading any model or calling any
-    API.
+    API. With `reparse=True` the saved raw answers are re-parsed with the
+    current parser and the CSVs rebuilt, again without querying any model.
     """
     if input_path is None:
         input_path = ANNOTATIONS / "bws_tuples.csv"
@@ -622,6 +712,13 @@ def run_llm_bws(input_path: Path | None = None,
         run_toy(tuples, out_dir, backends, toy)
         return
 
+    if reparse:
+        print(f"re-parsing saved raw answers for {', '.join(backends)}")
+        for backend in backends:
+            model = munin_model if backend == "munin" else deepseek_model
+            reparse_raws(tuples, model, out_dir)
+        return
+
     print(f"{len(tuples)} tuples to annotate with {', '.join(backends)}")
     for backend in backends:
         model = munin_model if backend == "munin" else deepseek_model
@@ -629,12 +726,12 @@ def run_llm_bws(input_path: Path | None = None,
             sys.exit("DEEPSEEK_API_KEY is not set - export it before running, "
                      "e.g. $env:DEEPSEEK_API_KEY = \"sk-...\"")
         _run_backend(tuples, backend, model, out_dir, limit, overwrite,
-                     timeout, max_new_tokens)
+                     timeout, max_new_tokens, workers)
 
 
 def _run_backend(tuples: list[dict], backend: str, model: str, out_dir: Path,
                  limit: int, overwrite: bool, timeout: int,
-                 max_new_tokens: int) -> None:
+                 max_new_tokens: int, workers: int = 1) -> None:
     work_dir = out_dir / model.rstrip("/").split("/")[-1]   # HF name or local path
     raw_dir = work_dir / "raw"
     parsed_dir = work_dir / "parsed"
@@ -664,24 +761,42 @@ def _run_backend(tuples: list[dict], backend: str, model: str, out_dir: Path,
         print(f"[{backend}] wrote {annotated}")
         return
 
-    done = failed = 0
-    for number, tup in enumerate(pending, start=1):
-        try:
-            messages = build_messages(tup)
-            response = query(messages)
-            # save both raw and parsed responses of the LLM
-            write_raw_answer(raw_dir, tup["tuple_id"], model, messages, response)
-            _, answer = write_parsed_answer(parsed_dir, tup, model, response)
+    # the local munin model stays sequential; only the API backend is parallel
+    workers = max(1, workers) if backend == "deepseek" else 1
+    print(f"[{backend}] using {workers} worker(s)", flush=True)
 
-            done += 1
-            print(f"[{backend} {number}/{len(pending)}] {tup['tuple_id']}: "
-                  f"best={answer['best']} worst={answer['worst']} ({answer['status']})",
-                  flush=True)
-        except (requests.RequestException, RuntimeError, KeyError, IndexError,
-                json.JSONDecodeError, OSError) as exc:
-            failed += 1
-            print(f"[{backend} {number}/{len(pending)}] {tup['tuple_id']}: ERROR {exc}",
-                  file=sys.stderr, flush=True)
+    def annotate(tup: dict) -> tuple[list[dict], dict]:
+        messages = build_messages(tup)
+        return messages, query(messages)
+
+    done = failed = 0
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {pool.submit(annotate, tup): tup for tup in pending}
+        for number, future in enumerate(as_completed(futures), start=1):
+            tup = futures[future]
+            try:
+                messages, response = future.result()
+                # files are written here in the main thread, never in workers
+                write_raw_answer(raw_dir, tup["tuple_id"], model, messages, response)
+                _, answer = write_parsed_answer(parsed_dir, tup, model, response)
+
+                done += 1
+                print(f"[{backend} {number}/{len(pending)}] {tup['tuple_id']}: "
+                      f"best={answer['best']} worst={answer['worst']} ({answer['status']})",
+                      flush=True)
+            except (requests.RequestException, RuntimeError, KeyError, IndexError,
+                    json.JSONDecodeError, OSError) as exc:
+                failed += 1
+                print(f"[{backend} {number}/{len(pending)}] {tup['tuple_id']}: ERROR {exc}",
+                      file=sys.stderr, flush=True)
+    except KeyboardInterrupt:
+        print("\ninterrupted - cancelling queued requests; saved answers are kept, "
+              "rerun to resume", file=sys.stderr)
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
 
     aggregate = write_aggregate(parsed_dir, work_dir)
     annotated = write_annotated_csv(tuples, parsed_dir,
